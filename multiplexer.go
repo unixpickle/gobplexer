@@ -1,11 +1,14 @@
 package gobplexer
 
 import (
-	"encoding/gob"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
+)
+
+const (
+	multiplexerBuffer       = 10
+	multiplexerAcceptBuffer = 5
 )
 
 // A Listener can accept new connections.
@@ -24,7 +27,7 @@ type Listener interface {
 // The other end of the Connection should use
 // MultiplexConnector.
 func MultiplexListener(c Connection) Listener {
-	return newConnMultiplexer(c, true)
+	return newMultiplexer(c, true)
 }
 
 // A Connector can establish new outgoing connections.
@@ -43,236 +46,270 @@ type Connector interface {
 // The other end of the Connection should use
 // MultiplexListener.
 func MultiplexConnector(c Connection) Connector {
-	return newConnMultiplexer(c, false)
+	return newMultiplexer(c, false)
 }
 
-func init() {
-	gob.Register(multiplexMsg{})
-	gob.Register(connMsg{})
-}
-
-type multiplexMsg struct {
+type multiplexerOutgoing struct {
 	ID       int64
-	New      bool
+	Payload  interface{}
+	Ack      bool
 	Close    bool
 	CloseAck bool
-	Payload  interface{}
+	Connect  bool
+	Accept   bool
 }
 
-type connMsg struct {
-	Payload interface{}
-	EOF     bool
+type multiplexerBin struct {
+	outgoing chan struct{}
+	incoming chan interface{}
 }
 
-// A connMultiplexer multiplexes a Connection by giving
-// IDs to different virtual connections.
-type connMultiplexer struct {
+type multiplexer struct {
 	conn Connection
 
-	lock    sync.RWMutex
+	binLock sync.RWMutex
+	bins    map[int64]*multiplexerBin
 	curID   int64
-	chanMap map[int64]chan connMsg
 
-	idChan chan int64
+	acceptIDs  chan int64
+	connectIDs chan int64
 
-	termLock      sync.Mutex
-	terminated    bool
+	terminateLock sync.Mutex
 	terminateChan chan struct{}
-
-	errLock sync.Mutex
-	err     error
 }
 
-func newConnMultiplexer(conn Connection, accepts bool) *connMultiplexer {
-	c := &connMultiplexer{
-		conn:          conn,
-		chanMap:       map[int64]chan connMsg{},
+func newMultiplexer(c Connection, accept bool) *multiplexer {
+	m := &multiplexer{
+		conn:          c,
+		bins:          map[int64]*multiplexerBin{},
 		terminateChan: make(chan struct{}),
 	}
-	if accepts {
-		c.idChan = make(chan int64)
+	if accept {
+		m.acceptIDs = make(chan int64, multiplexerAcceptBuffer)
+	} else {
+		m.connectIDs = make(chan int64, multiplexerAcceptBuffer)
+		for i := int64(0); i < multiplexerAcceptBuffer; i++ {
+			m.connectIDs <- i
+		}
 	}
-	go c.receiveLoop()
-	return c
+	go m.readLoop()
+	return m
 }
 
-func (c *connMultiplexer) Accept() (Connection, error) {
+func (m *multiplexer) Accept() (Connection, error) {
 	select {
-	case id := <-c.idChan:
-		return &subConn{multiplexer: c, id: id}, nil
-	case <-c.terminateChan:
-		return nil, c.firstError()
+	case id := <-m.acceptIDs:
+		ack := multiplexerOutgoing{
+			ID:     id,
+			Accept: true,
+		}
+		if err := m.conn.Send(ack); err != nil {
+			m.Close()
+			return nil, err
+		}
+		return &multiplexedConn{multiplexer: m, id: id}, nil
+	case <-m.terminateChan:
+		return nil, errors.New("multiplexer closed during accept")
 	}
 }
 
-func (c *connMultiplexer) Connect() (Connection, error) {
-	c.lock.Lock()
-	id := c.curID
-	c.curID++
-	c.chanMap[id] = make(chan connMsg, 1)
-	c.lock.Unlock()
-
+func (m *multiplexer) Connect() (Connection, error) {
 	select {
-	case <-c.terminateChan:
-		return nil, c.firstError()
+	case id := <-m.connectIDs:
+		if err := m.allocateBin(id); err != nil {
+			return nil, err
+		}
+		err := m.conn.Send(multiplexerOutgoing{
+			ID:      id,
+			Connect: true,
+		})
+		if err != nil {
+			m.Close()
+			return nil, err
+		}
+		return &multiplexedConn{multiplexer: m, id: id}, nil
+	case <-m.terminateChan:
+		return nil, errors.New("multiplexer closed during connect")
+	}
+
+}
+
+func (m *multiplexer) Close() error {
+	m.terminateLock.Lock()
+	select {
+	case <-m.terminateChan:
+		m.terminateLock.Unlock()
+		return errors.New("multiplexer already closed")
 	default:
+		close(m.terminateChan)
+		m.terminateLock.Unlock()
+		return m.conn.Close()
 	}
-
-	err := c.conn.Send(multiplexMsg{
-		ID:  id,
-		New: true,
-	})
-	return &subConn{multiplexer: c, id: id}, err
 }
 
-func (c *connMultiplexer) CloseID(id int64) error {
-	return c.conn.Send(multiplexMsg{
+func (m *multiplexer) readLoop() {
+	defer m.Close()
+	nextConnID := int64(multiplexerAcceptBuffer)
+	for {
+		obj, err := m.conn.Receive()
+		if err != nil {
+			return
+		}
+		msg, ok := obj.(multiplexerOutgoing)
+		if !ok {
+			return
+		}
+		switch true {
+		case msg.Accept:
+			if m.connectIDs == nil {
+				// They accepted when we should be accepting.
+				return
+			}
+			nextConnID++
+			select {
+			case m.connectIDs <- nextConnID:
+			default:
+				// They accepted more than we connected.
+				return
+			}
+			nextConnID++
+		case msg.Ack:
+			if bin := m.binForID(msg.ID); bin != nil {
+				select {
+				case bin.outgoing <- struct{}{}:
+				default:
+					// They acked more than we sent.
+					return
+				}
+			}
+		case msg.Close:
+			ack := multiplexerOutgoing{
+				ID:       msg.ID,
+				CloseAck: true,
+			}
+			if m.conn.Send(ack) != nil {
+				return
+			}
+			fallthrough
+		case msg.CloseAck:
+			m.binLock.Lock()
+			bin := m.bins[msg.ID]
+			delete(m.bins, msg.ID)
+			m.binLock.Unlock()
+			if bin != nil {
+				close(bin.incoming)
+				close(bin.outgoing)
+			}
+		case msg.Connect:
+			if m.acceptIDs == nil {
+				// They tried to connect but we aren't accepting.
+				return
+			}
+			if m.allocateBin(msg.ID) != nil {
+				return
+			}
+			select {
+			case m.acceptIDs <- msg.ID:
+			default:
+				// They made too many unacknowledged connections.
+				return
+			}
+		default:
+			if bin := m.binForID(msg.ID); bin != nil {
+				select {
+				case bin.incoming <- msg.Payload:
+				default:
+					// They sent too many unacknowledged messages.
+					return
+				}
+			}
+		}
+	}
+}
+
+func (m *multiplexer) send(id int64, obj interface{}) error {
+	bin := m.binForID(id)
+	if bin == nil {
+		return errors.New("cannot send on closed connection")
+	}
+	select {
+	case <-bin.outgoing:
+	case <-m.terminateChan:
+		return errors.New("multiplexer closed during send")
+	}
+	out := multiplexerOutgoing{
+		ID:      id,
+		Payload: obj,
+	}
+	return m.conn.Send(out)
+}
+
+func (m *multiplexer) receive(id int64) (interface{}, error) {
+	bin := m.binForID(id)
+	if bin == nil {
+		return nil, io.EOF
+	}
+	select {
+	case datum, ok := <-bin.incoming:
+		if !ok {
+			return nil, io.EOF
+		}
+		ack := multiplexerOutgoing{
+			ID:  id,
+			Ack: true,
+		}
+		if err := m.conn.Send(ack); err != nil {
+			m.Close()
+			return nil, err
+		}
+		return datum, nil
+	case <-m.terminateChan:
+		return nil, errors.New("multiplexer closed during receive")
+	}
+}
+
+func (m *multiplexer) closeID(id int64) error {
+	return m.conn.Send(multiplexerOutgoing{
 		ID:    id,
 		Close: true,
 	})
 }
 
-func (c *connMultiplexer) Send(id int64, obj interface{}) error {
-	return c.conn.Send(multiplexMsg{
-		ID:      id,
-		Payload: obj,
-	})
+func (m *multiplexer) binForID(id int64) *multiplexerBin {
+	m.binLock.RLock()
+	defer m.binLock.RUnlock()
+	return m.bins[id]
 }
 
-func (c *connMultiplexer) Receive(id int64) (interface{}, error) {
-	c.lock.RLock()
-	ch := c.chanMap[id]
-	c.lock.RUnlock()
-
-	if ch == nil {
-		return nil, io.EOF
+func (m *multiplexer) allocateBin(id int64) error {
+	m.binLock.Lock()
+	if _, ok := m.bins[id]; ok {
+		return errors.New("attempt to overwrite existing bin")
 	}
-
-	select {
-	case res, ok := <-ch:
-		if !ok {
-			return nil, c.firstError()
-		}
-		if res.EOF {
-			return nil, io.EOF
-		}
-		return res.Payload, nil
-	case <-c.terminateChan:
-		return nil, c.firstError()
+	m.bins[id] = &multiplexerBin{
+		outgoing: make(chan struct{}, multiplexerBuffer),
+		incoming: make(chan interface{}, multiplexerBuffer),
 	}
-}
-
-func (c *connMultiplexer) Close() error {
-	c.gotError(errors.New("multiplexer closed"))
-	c.termLock.Lock()
-	if c.terminated {
-		c.termLock.Unlock()
-		return c.firstError()
+	for i := 0; i < multiplexerBuffer; i++ {
+		m.bins[id].outgoing <- struct{}{}
 	}
-	c.terminated = true
-	close(c.terminateChan)
-	c.termLock.Unlock()
-	return c.conn.Close()
+	m.binLock.Unlock()
+	return nil
 }
 
-func (c *connMultiplexer) receiveLoop() {
-	defer func() {
-		c.Close()
-		c.lock.Lock()
-		for _, ch := range c.chanMap {
-			close(ch)
-		}
-		c.chanMap = map[int64]chan connMsg{}
-		c.lock.Unlock()
-	}()
-	for {
-		msg, err := c.conn.Receive()
-		if err != nil {
-			c.gotError(err)
-			return
-		}
-		msgVal, ok := msg.(multiplexMsg)
-		if !ok {
-			c.gotError(fmt.Errorf("unexpected multiplexer message type: %T", msg))
-			return
-		}
-		switch true {
-		case msgVal.New:
-			if c.idChan == nil {
-				c.gotError(errors.New("multiplexer cannot accept connections"))
-				return
-			}
-			c.lock.Lock()
-			id := c.curID
-			c.curID++
-			c.chanMap[id] = make(chan connMsg, 1)
-			c.lock.Unlock()
-			select {
-			case c.idChan <- id:
-			case <-c.terminateChan:
-				return
-			}
-		case msgVal.Close:
-			c.conn.Send(multiplexMsg{
-				ID:       msgVal.ID,
-				CloseAck: true,
-			})
-			fallthrough
-		case msgVal.CloseAck:
-			c.lock.Lock()
-			ch := c.chanMap[msgVal.ID]
-			delete(c.chanMap, msgVal.ID)
-			c.lock.Unlock()
-			if ch != nil {
-				select {
-				case ch <- connMsg{EOF: true}:
-					close(ch)
-				case <-c.terminateChan:
-					return
-				}
-			}
-		default:
-			c.lock.RLock()
-			ch := c.chanMap[msgVal.ID]
-			c.lock.RUnlock()
-			if ch != nil {
-				select {
-				case ch <- connMsg{Payload: msgVal.Payload}:
-				case <-c.terminateChan:
-					return
-				}
-			}
-		}
-	}
-}
-
-func (c *connMultiplexer) gotError(e error) {
-	c.errLock.Lock()
-	defer c.errLock.Unlock()
-	if c.err == nil {
-		c.err = e
-	}
-}
-
-func (c *connMultiplexer) firstError() error {
-	c.errLock.Lock()
-	defer c.errLock.Unlock()
-	return c.err
-}
-
-type subConn struct {
-	multiplexer *connMultiplexer
+type multiplexedConn struct {
+	multiplexer *multiplexer
 	id          int64
 }
 
-func (s *subConn) Send(obj interface{}) error {
-	return s.multiplexer.Send(s.id, obj)
+func (m *multiplexedConn) Send(obj interface{}) error {
+	return m.multiplexer.send(m.id, obj)
 }
 
-func (s *subConn) Receive() (interface{}, error) {
-	return s.multiplexer.Receive(s.id)
+func (m *multiplexedConn) Receive() (interface{}, error) {
+	return m.multiplexer.receive(m.id)
 }
 
-func (s *subConn) Close() error {
-	return s.multiplexer.CloseID(s.id)
+func (m *multiplexedConn) Close() error {
+	return m.multiplexer.closeID(m.id)
 }
