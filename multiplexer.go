@@ -1,6 +1,7 @@
 package gobplexer
 
 import (
+	"encoding/gob"
 	"errors"
 	"io"
 	"sync"
@@ -47,6 +48,10 @@ type Connector interface {
 // MultiplexListener.
 func MultiplexConnector(c Connection) Connector {
 	return newMultiplexer(c, false)
+}
+
+func init() {
+	gob.Register(multiplexerOutgoing{})
 }
 
 type multiplexerOutgoing struct {
