@@ -65,6 +65,7 @@ type multiplexerOutgoing struct {
 }
 
 type multiplexerBin struct {
+	closed   bool
 	outgoing chan struct{}
 	incoming chan interface{}
 }
@@ -136,7 +137,6 @@ func (m *multiplexer) Connect() (Connection, error) {
 	case <-m.terminateChan:
 		return nil, errors.New("multiplexer closed during connect")
 	}
-
 }
 
 func (m *multiplexer) Close() error {
@@ -179,7 +179,7 @@ func (m *multiplexer) readLoop() {
 			}
 			nextConnID++
 		case msg.Ack:
-			if bin := m.binForID(msg.ID); bin != nil {
+			if bin := m.binForID(msg.ID); bin != nil && !bin.closed {
 				select {
 				case bin.outgoing <- struct{}{}:
 				default:
@@ -188,6 +188,12 @@ func (m *multiplexer) readLoop() {
 				}
 			}
 		case msg.Close:
+			bin := m.binForID(msg.ID)
+			if bin != nil && !bin.closed {
+				bin.closed = true
+				close(bin.incoming)
+				close(bin.outgoing)
+			}
 			ack := multiplexerOutgoing{
 				ID:       msg.ID,
 				CloseAck: true,
@@ -197,13 +203,12 @@ func (m *multiplexer) readLoop() {
 					m.Close()
 				}
 			}()
-			fallthrough
 		case msg.CloseAck:
 			m.binLock.Lock()
 			bin := m.bins[msg.ID]
 			delete(m.bins, msg.ID)
 			m.binLock.Unlock()
-			if bin != nil {
+			if bin != nil && !bin.closed {
 				close(bin.incoming)
 				close(bin.outgoing)
 			}
@@ -222,7 +227,7 @@ func (m *multiplexer) readLoop() {
 				return
 			}
 		default:
-			if bin := m.binForID(msg.ID); bin != nil {
+			if bin := m.binForID(msg.ID); bin != nil && !bin.closed {
 				select {
 				case bin.incoming <- msg.Payload:
 				default:
@@ -240,7 +245,10 @@ func (m *multiplexer) send(id int64, obj interface{}) error {
 		return errors.New("cannot send on closed connection")
 	}
 	select {
-	case <-bin.outgoing:
+	case _, ok := <-bin.outgoing:
+		if !ok {
+			return errors.New("remote end has disconnected")
+		}
 	case <-m.terminateChan:
 		return errors.New("multiplexer closed during send")
 	}
