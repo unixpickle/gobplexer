@@ -47,7 +47,7 @@ func NewConnectionConn(c net.Conn) *gobConn {
 func (g *gobConn) Send(obj interface{}) error {
 	g.writeLock.Lock()
 	defer g.writeLock.Unlock()
-	return g.enc.Encode(obj)
+	return g.enc.Encode(&obj)
 }
 
 func (g *gobConn) Receive() (interface{}, error) {
