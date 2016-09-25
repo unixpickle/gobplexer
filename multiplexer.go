@@ -291,6 +291,7 @@ func (m *multiplexer) binForID(id int64) *multiplexerBin {
 func (m *multiplexer) allocateBin(id int64) error {
 	m.binLock.Lock()
 	if _, ok := m.bins[id]; ok {
+		m.binLock.Unlock()
 		return errors.New("attempt to overwrite existing bin")
 	}
 	m.bins[id] = &multiplexerBin{
