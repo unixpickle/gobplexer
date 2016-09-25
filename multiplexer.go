@@ -192,9 +192,11 @@ func (m *multiplexer) readLoop() {
 				ID:       msg.ID,
 				CloseAck: true,
 			}
-			if m.conn.Send(ack) != nil {
-				return
-			}
+			go func() {
+				if m.conn.Send(ack) != nil {
+					m.Close()
+				}
+			}()
 			fallthrough
 		case msg.CloseAck:
 			m.binLock.Lock()
