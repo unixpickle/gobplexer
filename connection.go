@@ -20,6 +20,7 @@ type Connection interface {
 	Receive() (interface{}, error)
 
 	// Close closes the connection.
+	// Any Send or Receive operations will be unblocked.
 	Close() error
 }
 

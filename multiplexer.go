@@ -55,16 +55,16 @@ func init() {
 }
 
 type multiplexerOutgoing struct {
-	ID       int64
-	Payload  interface{}
-	Ack      bool
-	Close    bool
-	CloseAck bool
-	Connect  bool
-	Accept   bool
+	ID      int64
+	Payload interface{}
+	Ack     bool
+	Close   bool
+	Connect bool
+	Accept  bool
 }
 
 type multiplexerBin struct {
+	sendLock sync.Mutex
 	closed   bool
 	outgoing chan struct{}
 	incoming chan interface{}
@@ -179,38 +179,28 @@ func (m *multiplexer) readLoop() {
 			}
 			nextConnID++
 		case msg.Ack:
-			if bin := m.binForID(msg.ID); bin != nil && !bin.closed {
-				select {
-				case bin.outgoing <- struct{}{}:
-				default:
-					// They acked more than we sent.
-					return
+			if bin := m.binForID(msg.ID); bin != nil {
+				bin.sendLock.Lock()
+				if !bin.closed {
+					select {
+					case bin.outgoing <- struct{}{}:
+					default:
+						// They acked more than we sent.
+						bin.sendLock.Unlock()
+						return
+					}
 				}
+				bin.sendLock.Unlock()
 			}
 		case msg.Close:
-			bin := m.binForID(msg.ID)
-			if bin != nil && !bin.closed {
-				bin.closed = true
-				close(bin.incoming)
-				close(bin.outgoing)
-			}
-			ack := multiplexerOutgoing{
-				ID:       msg.ID,
-				CloseAck: true,
-			}
-			go func() {
-				if m.conn.Send(ack) != nil {
-					m.Close()
+			if bin := m.binForID(msg.ID); bin != nil {
+				bin.sendLock.Lock()
+				if !bin.closed {
+					close(bin.incoming)
+					close(bin.outgoing)
+					bin.closed = true
 				}
-			}()
-		case msg.CloseAck:
-			m.binLock.Lock()
-			bin := m.bins[msg.ID]
-			delete(m.bins, msg.ID)
-			m.binLock.Unlock()
-			if bin != nil && !bin.closed {
-				close(bin.incoming)
-				close(bin.outgoing)
+				bin.sendLock.Unlock()
 			}
 		case msg.Connect:
 			if m.acceptIDs == nil {
@@ -227,13 +217,18 @@ func (m *multiplexer) readLoop() {
 				return
 			}
 		default:
-			if bin := m.binForID(msg.ID); bin != nil && !bin.closed {
-				select {
-				case bin.incoming <- msg.Payload:
-				default:
-					// They sent too many unacknowledged messages.
-					return
+			if bin := m.binForID(msg.ID); bin != nil {
+				bin.sendLock.Lock()
+				if !bin.closed {
+					select {
+					case bin.incoming <- msg.Payload:
+					default:
+						// They sent too many unacknowledged messages.
+						bin.sendLock.Unlock()
+						return
+					}
 				}
+				bin.sendLock.Unlock()
 			}
 		}
 	}
@@ -284,6 +279,21 @@ func (m *multiplexer) receive(id int64) (interface{}, error) {
 }
 
 func (m *multiplexer) closeID(id int64) error {
+	m.binLock.Lock()
+	bin := m.bins[id]
+	delete(m.bins, id)
+	m.binLock.Unlock()
+
+	if bin != nil {
+		bin.sendLock.Lock()
+		if !bin.closed {
+			bin.closed = true
+			close(bin.incoming)
+			close(bin.outgoing)
+		}
+		bin.sendLock.Unlock()
+	}
+
 	return m.conn.Send(multiplexerOutgoing{
 		ID:    id,
 		Close: true,
