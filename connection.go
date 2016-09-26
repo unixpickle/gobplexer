@@ -35,9 +35,8 @@ type gobConn struct {
 	enc       *gob.Encoder
 }
 
-// NewConnectionConn creates a Connection that directly
-// wraps a net.Conn.
-func NewConnectionConn(c net.Conn) *gobConn {
+// NetConnection creates a Connection around a net.Conn.
+func NetConnection(c net.Conn) *gobConn {
 	return &gobConn{
 		conn: c,
 		dec:  gob.NewDecoder(c),
