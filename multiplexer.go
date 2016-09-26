@@ -27,6 +27,9 @@ type Listener interface {
 // a Connection into multiple incoming connections.
 // The other end of the Connection should use
 // MultiplexConnector.
+//
+// If c is disconnected or if the resulting listener is
+// closed, all child connections will be disconnected.
 func MultiplexListener(c Connection) Listener {
 	return newMultiplexer(c, true)
 }
@@ -46,6 +49,9 @@ type Connector interface {
 // a Connection into multiple outgoing connections.
 // The other end of the Connection should use
 // MultiplexListener.
+//
+// If c is disconnected or if the resulting connector is
+// closed, all child connections will be disconnected.
 func MultiplexConnector(c Connection) Connector {
 	return newMultiplexer(c, false)
 }
@@ -239,6 +245,13 @@ func (m *multiplexer) send(id int64, obj interface{}) error {
 	if bin == nil {
 		return errors.New("cannot send on closed connection")
 	}
+
+	select {
+	case <-m.terminateChan:
+		return errors.New("cannot send on closed connection")
+	default:
+	}
+
 	select {
 	case _, ok := <-bin.outgoing:
 		if !ok {
