@@ -21,6 +21,8 @@ type Connection interface {
 
 	// Close closes the connection.
 	// Any Send or Receive operations will be unblocked.
+	// Close may be called multiple times, but any time
+	// after the first will likely return an error.
 	Close() error
 }
 
