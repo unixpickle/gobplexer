@@ -2,7 +2,7 @@ package gobplexer
 
 import (
 	"encoding/gob"
-	"net"
+	"io"
 	"sync"
 )
 
@@ -26,9 +26,9 @@ type Connection interface {
 	Close() error
 }
 
-// A gobConn is a Connection that wraps a net.Conn.
+// A gobConn is a Connection that wraps a data stream.
 type gobConn struct {
-	conn net.Conn
+	conn io.ReadWriteCloser
 
 	readLock sync.Mutex
 	dec      *gob.Decoder
@@ -37,11 +37,14 @@ type gobConn struct {
 	enc       *gob.Encoder
 }
 
-// NetConnection creates a Connection around a net.Conn.
+// NetConnection creates a Connection around a raw
+// communications channel.
+// It is meant to be used to wrap things like net.Conn in
+// a Connection.
 //
-// If the resulting Connection is closed, c will be closed
-// as well.
-func NetConnection(c net.Conn) Connection {
+// When the resulting Connection is closed, c will be
+// closed as well.
+func NetConnection(c io.ReadWriteCloser) Connection {
 	return &gobConn{
 		conn: c,
 		dec:  gob.NewDecoder(c),
