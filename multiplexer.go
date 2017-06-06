@@ -30,6 +30,9 @@ type Listener interface {
 //
 // If c is disconnected or if the resulting listener is
 // closed, all child connections will be disconnected.
+//
+// If the resulting Listener is closed, c is closed as
+// well.
 func MultiplexListener(c Connection) Listener {
 	return newMultiplexer(c, true)
 }
@@ -52,6 +55,9 @@ type Connector interface {
 //
 // If c is disconnected or if the resulting connector is
 // closed, all child connections will be disconnected.
+//
+// If the resulting Connector is closed, c is closed as
+// well.
 func MultiplexConnector(c Connection) Connector {
 	return newMultiplexer(c, false)
 }

@@ -38,6 +38,9 @@ type gobConn struct {
 }
 
 // NetConnection creates a Connection around a net.Conn.
+//
+// If the resulting Connection is closed, c will be closed
+// as well.
 func NetConnection(c net.Conn) Connection {
 	return &gobConn{
 		conn: c,
